@@ -1,0 +1,29 @@
+# never commit session data / transcripts / personal memory or secrets
+*.jsonl.zstd
+session-*/
+transcripts/
+AGENTS.md
+CLAUDE.md
+MEMORY.md
+USER.md
+SOUL.md
+*.db
+*.db-wal
+*.db-shm
+.env
+.env.*
+auth.json
+*_history
+*_map.json
+
+# caches / editor / OS
+__pycache__/
+*.pyc
+.DS_Store
+.vscode/
+.idea/
+node_modules/
+
+# working dirs
+sessions/
+normalized/
