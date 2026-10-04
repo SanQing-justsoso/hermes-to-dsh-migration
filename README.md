@@ -33,6 +33,11 @@ DSH 的会话持久化（`@deepseek-ai/dsh-session-persistence-jsonl`）有几�
 不会自动串联多帧。所以必须自己按帧切分 —— 见 `scripts/zstd_frames.py`（按 RFC 8878 解析
 frame header + block header，精确求出每个 frame 的字节区间）。
 
+反过来**写**帧时 Node 也能产出 DSH 同款帧，但有个坑：`{checksum:true}` 选项在 Node 22 上被
+**静默忽略**，必须走低层参数：
+`zlib.zstdCompressSync(buf, { params: { [zlib.constants.ZSTD_c_checksumFlag]: 1 } })`
+（产出 FHD `00100100` = single_segment + checksum，与 DSH 自己的 writer 逐位同款）。
+
 ---
 
 ## 2. v4 事件模型
@@ -105,6 +110,29 @@ DSH 打开会话会用一组严格校验器复盘日志；不合法直接 `is co
 ### 3.6 `user/message` 不需要 turn/step
 `user/message` 的 data 就是消息体（无 turn/step），且不在 `STEP_EVENT_TYPES` 里，不需要开 step。
 
+### 3.7 `system/message` 的 protected surface head（导入会话“续写即炸”的坑）
+`Relationships.foldSurface`（v3→v4 迁移器与加载器同一规则）要求：
+**surface 的第一个事件必须是 `system/message`** —— 它建立 `protectedHead`。之后每当
+`system/message` 到达时若 `surface.length > 0 && protectedHead === undefined`，直接抛
+`SessionFormatError: system/message requires a protected first surface head`。
+
+* 原生会话的首条 surface 事件就是 system/message，永远合法
+* 本管线产出的导入日志 surface 从 `user/message` 起 → **只读无恙，一旦被原生续写就整条拒载**：
+  宿主恢复会话时会在新 turn 的第一步补发一条 `system/message`，恰好踩中上面的条件
+  （实测 221 条导入会话全是这个形状，任何一条被续写都会中招）
+* **官方修法**（dsh-chat-import 插件 ≥0.18.3，其 `convert/events.mjs` 的注释明确记录了这个 issue）：
+  在**第一个 `step/start` 之后、任何 surface 事件之前**插一条**空 content** 的
+  `system/message`：`surfaceOp:"append"`、`source:{kind:"system-prompt"}`、`message.id` 任意字符串。
+  head 只占住 surface 第 0 节点、**不虚构提示词**（真正的提示词由宿主下一步替换或归一化）
+* **自修工具**（§6）：`repair_head.mjs` = 插 head + 稠密重排 seq + 重映射全部
+  `sourceEventSeqs`/`messageSeqs` 引用 + 逐帧 checksum 重打包 + loader 规则离线校验，
+  失败不产出；`batch_repair_heads.mjs` 批量跑（只写 staging，不碰线上树），
+  `install_head_repairs.py` 装机（flock 探测占用→跳过、备份、原子替换）
+
+> 附带知识点：`agent/inbox/spliced` 等事件**不进 surface**（`SURFACE_TYPES` 只有
+> system/message / user/message / assistant/message / tool/result 四种）。判断"会不会炸"
+> 只看首条 surface 事件的类型，别被日志里其他事件的先后位置误导。
+
 ---
 
 ## 4. 迁移管线
@@ -151,6 +179,9 @@ DSH 打开会话会用一组严格校验器复盘日志；不合法直接 `is co
 # 切分并验证一份 DSH 会话的帧结构
 python3 scripts/zstd_frames.py /path/to/session.v4.jsonl.zstd
 
+# 逐帧解码成可读 JSONL（Node 内置 zstd，无第三方依赖）
+node scripts/decode_zstd_lines.js /path/to/session.v4.jsonl.zstd /tmp/session.jsonl
+
 # 规范化 → 编码 → 严格校验
 python3 scripts/zstd_frames.py /path/to/session.v4.jsonl.zstd > frames.json
 NORM_DIR=./normalized OUT_DIR=./sessions SESSION_CWD="<cwd>" node scripts/hermes_to_dsh.mjs ./sessions
@@ -158,10 +189,22 @@ python3 scripts/strict_validate.py ./sessions
 
 # 安装/对账到 DSH
 DSH_HOME=~/.dsh bash scripts/install_sessions.sh
+
+# 修复缺失的 protected surface head（§3.7）：单条
+node scripts/repair_head.mjs session.v4.jsonl.zstd repaired.zstd --id <sessionId>
+
+# 批量：发现 → 分类 → 修复 → 只写 staging（不碰线上树）
+node scripts/batch_repair_heads.mjs --sessions-root "$DSH_HOME/sessions/<sanitized-cwd>" --staging ./staging
+
+# 装机：探测 lock 占用（占用的跳过）→ 备份 → 原子替换
+python3 scripts/install_head_repairs.py --staging ./staging \
+    --sessions-root "$DSH_HOME/sessions/<sanitized-cwd>" --backup ./backup
 ```
 
 `scripts/strict_validate.py` 复刻了 §3 的全部校验规则（含 `Relationships` 状态机）——
 **在上传/安装前本地把 100% 会话跑绿，能省掉对方逐个打开才报错的来回。**
+`repair_head.mjs` 内建同一套规则的校验（含 §3.7 的 protected head 规则），
+校验不过**不产出文件**；批量流程刻意分成 staging + 安装两步，装之前全部本地跑绿。
 
 ### 文件
 
@@ -171,6 +214,10 @@ DSH_HOME=~/.dsh bash scripts/install_sessions.sh
 | `scripts/hermes_to_dsh.mjs` | 规范化数据 → 合法 v4 事件日志（Node 内置 zstd 逐帧压缩） |
 | `scripts/strict_validate.py` | 复刻 DSH v4 校验器，离线全量体检 |
 | `scripts/install_sessions.sh` / `scripts/deploy.mjs` | 自对账安装：识别并替换既有导入，收敛 workspace.json |
+| `scripts/decode_zstd_lines.js` | 逐帧解码 v4 日志为 JSONL（Node zlib 只解第一帧，必须自己切） |
+| `scripts/repair_head.mjs` | 修复 §3.7：插 protected head + 重排 seq + 重映射引用 + 重打包，内建校验失败不产出 |
+| `scripts/batch_repair_heads.mjs` | 批量版 repair：发现 → 分类 → 修复 → staging，不碰线上树 |
+| `scripts/install_head_repairs.py` | 装机：flock 探测占用跳过、备份原文件、原子替换 |
 
 ---
 
